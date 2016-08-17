@@ -13,3 +13,7 @@ References
 - [4] 	JUnit - Is a unit testing framework for the Java programming language.
 - [5] 	Cobertura - Is a Java code coverage analysis tool. You can use it to determine what percentage of your source code is exercised by your unit tests.
 - [6]	Hudson - Is an extensible Continuous Integration Server.
+
+## pom.xml
+
+maven config file for findbugs, checkstyle and PMD

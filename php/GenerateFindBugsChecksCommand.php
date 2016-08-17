@@ -23,6 +23,7 @@ class GenerateFindBugsChecksCommand extends ContainerAwareCommand
     const BUGPATTERN_DESC_SOURCE_FILE = 'https://raw.githubusercontent.com/findbugsproject/findbugs/master/findbugs/etc/messages.xml';
     const BUGPATTERN_RANK_FILE = 'https://raw.githubusercontent.com/findbugsproject/findbugs/master/findbugs/etc/bugrank.txt';
     const BUGPATTERN_SOURCE_FILE = 'https://raw.githubusercontent.com/findbugsproject/findbugs/master/findbugs/etc/findbugs.xml';
+    const FIND_SEC_PLUG_SOURCE_FILE = 'https://raw.githubusercontent.com/find-sec-bugs/find-sec-bugs/master/plugin/src/main/resources/metadata/messages.xml';
 
     /** @var  HtmlGenerator */
     private $htmlGenerator;
@@ -118,6 +119,7 @@ class GenerateFindBugsChecksCommand extends ContainerAwareCommand
 
             $updatedlabelNames = $this->getLabelFromBugCategory($bugCategory);
             if ($specification->getLabels()->isEmpty()) {
+                $labels = array();
 
                 foreach($updatedlabelNames as $slugName => $labelName) {
                     $label = $this->findLabel($slugName, $labelName, $output);
@@ -134,6 +136,18 @@ class GenerateFindBugsChecksCommand extends ContainerAwareCommand
                 $output->writeln('Labels: ' . implode(', ', $labelNames));
 
                 $specification->setLabels($labels);
+            }
+
+            if (!$specification->hasParametrization() && isset($bugPatternData[$bugName]['message'])){
+                $message = $bugPatternData[$bugName]['message'];
+                $parameterNames = array();
+                $message = preg_replace_callback("/\{([^\}]+)\}/", function($match)use(&$parameterNames){
+                    $parameterNames[] = 'position_'. $match[1];
+
+                    return '{position_'.$match[1].'}';
+                }, $message);
+
+                $specification->setParametrization($message, $parameterNames);
             }
 
             $this->em->persist($specification);
@@ -179,57 +193,78 @@ class GenerateFindBugsChecksCommand extends ContainerAwareCommand
     {
         $rst = '';
         $details = isset($bugPatternData[$bugName]['details']) ? $bugPatternData[$bugName]['details'] : '';
-        $details = str_replace(array('<![CDATA[', ']]>'), '', $details);
+        $details = str_replace(array('<![CDATA[', ']]>'), array('', ''), $details);
+        $details = preg_replace('/<!--.*?-->/', '', $details);
 
-        $dom = new \DOMDocument;
-        libxml_use_internal_errors(true);
-        $dom->loadHTML($details);
-        libxml_use_internal_errors(false);
+        var_dump($details);
+        if(!empty($details)){
+            $dom = new \DOMDocument;
+            libxml_use_internal_errors(true);
+            $dom->loadHTML($details);
+            libxml_use_internal_errors(false);
 
-        $content = $this->printRst($dom);
+            $content = $this->printRst($dom);
 
-        if ($rst) {
-            $rst .= <<< TEMPLATE
-Details:
+            $rst = <<< TEMPLATE
+
 $content
 
 TEMPLATE;
+
         }
-
-
-
         return $rst;
     }
 
-    private function printRst(\DOMDocument $node)
+    private function printRst(\DOMNode $node, $isCodeNode = false)
     {
-        if ($node->childNodes->length <= 0) {
-            return $node->nodeValue;
+        if ( ! $node->hasChildNodes()){
+            if($node->nodeName === 'br'){
+                return "\n| ";
+            }
+            if($isCodeNode){
+                return  $node->nodeValue;
+            }
+            return trim(preg_replace( array("/\r|\n|\t/", '/\s+/') , array(' ', ' '), $node->nodeValue));
         }
 
         $rst = '';
         for ($i=0; $i<$node->childNodes->length; $i++) {
-            $rst .= $this->printRst($node->childNodes->item($i));
+            $rst .= $this->printRst($node->childNodes->item($i), $isCodeNode || $node->nodeName === 'pre');
         }
 
         switch ($node->nodeName) {
             case 'i':
                 return '*'.$rst.'*';
 
+            case 'b':
+                return '**'.$rst.'**';
+
+            case 'li':
+                return "\n- ".$rst."\n";
+
+            case 'h3':
+                return "\n**".$rst."**\n";
+
             case 'p':
                 return $rst."\n\n";
 
+            case 'blockquote':
+                return str_replace("\n| ", "\n|     ", $rst);
+
+            case 'sup':
+                return ' ['.$rst.']_ ';
+
             case 'a':
-                return '`'. $rst . '<' . $node->getAttribute('href') . '>`_';
+                return '`'. $rst . ' <' . $node->getAttribute('href') . '>`_';
 
             case 'code':
                 return '``'.$rst.'``';
 
             case 'pre':
-                return '.. code-block:: '. "\n" . $rst;
+                return "\n".'.. code-block:: java'. "\n\n" . preg_replace( "/\r|\n/", "\n    ", str_pad($rst, strlen($rst)+4, ' ', STR_PAD_LEFT))."\n\n";
         }
 
-        return $rst;
+        return $rst. "\n";
     }
 
     private function indexSpecifications(OutputInterface $output)
@@ -263,7 +298,7 @@ TEMPLATE;
         $content = $this->getFileByUrl(self::BUGPATTERN_SOURCE_FILE, $output);
         $doc = XmlUtils::safeParse($content);
 
-        $bugDescData = $this->loadBugDescData($output);
+        $bugDescData = $this->loadBugDescData(self::BUGPATTERN_DESC_SOURCE_FILE, $output);
         $bugRankData = $this->loadBugRankData($output);
 
         foreach ($doc->xpath('//BugPattern') as $bugPattern){
@@ -271,25 +306,38 @@ TEMPLATE;
             $bugCategoryName = (string) $bugPattern->attributes()->category;
             $bugKind = (string) $bugPattern->attributes()->abbrev;
 
-            $rank = $this->getBugPatternRank($bugPatternName, $bugCategoryName, $bugKind, $bugRankData, $output);
+            $rank = $this->getBugPatternRank($bugPatternName, $bugCategoryName, $bugKind, $bugRankData);
 
-            if(isset($bugDescData[$bugPatternName])){
-                $bugPatternData[] = array( $bugCategoryName.$bugPatternName => array(
-                    'description' => $bugDescData[$bugPatternName]['description'],
-                    'rank' => $rank,
-                    'details' => $bugDescData[$bugPatternName]['details']
-                ));
+            if(isset($bugDescData[$bugPatternName]) && !empty($rank)){
+                if (preg_match("/\{([^\}]+)\}/", $bugDescData[$bugPatternName]['longDescription'])){
+                    $bugPatternData[$bugCategoryName.'.'.$bugPatternName] = array(
+                        'description' => $bugDescData[$bugPatternName]['description'],
+                        'rank' => $rank,
+                        'details' => $bugDescData[$bugPatternName]['details'],
+                        'message' => $bugDescData[$bugPatternName]['longDescription']
+                    );
+                }else{
+                    $bugPatternData[$bugCategoryName.'.'.$bugPatternName] = array(
+                        'description' => $bugDescData[$bugPatternName]['description'],
+                        'rank' => $rank,
+                        'details' => $bugDescData[$bugPatternName]['details']
+                    );
+                }
+
             }
 
         }
 
+        $pluginBugPatternData = $this->loadPluginBugPatternData(self::FIND_SEC_PLUG_SOURCE_FILE, $output);
+        $bugPatternData = array_merge($bugPatternData, $pluginBugPatternData);
+
         return $bugPatternData;
     }
 
-    private function loadBugDescData(OutputInterface $output)
+    private function loadBugDescData($url, OutputInterface $output)
     {
         $bugDescData = array();
-        $content = $this->getFileByUrl(self::BUGPATTERN_DESC_SOURCE_FILE, $output);
+        $content = $this->getFileByUrl($url, $output);
 
         if(empty($content)){
             throw new \RuntimeException('Cannot load Description data for Bug Pattern');
@@ -299,12 +347,14 @@ TEMPLATE;
         foreach($doc->xpath('//BugPattern') as $bugPattern) {
             $bugPatternName = (string) $bugPattern->attributes()->type;
             $description = (string) $bugPattern->ShortDescription;
+            $longDescription = (string) $bugPattern->LongDescription;
             $details = (string) $bugPattern->Details;
 
-            $bugDescData[] = array( $bugPatternName => array(
+            $bugDescData[$bugPatternName] = array(
                 'description' => $description,
+                'longDescription' => $longDescription,
                 'details' => $details
-            ));
+            );
         }
         return $bugDescData;
     }
@@ -321,7 +371,7 @@ TEMPLATE;
         foreach(preg_split("/((\r?\n)|(\r\n?))/", $content) as $line){
             if (!empty($line)){
                 $lineArr = explode(' ', $line);
-                $bugRankData[] = array($lineArr[2] => array($lineArr[1] , (int) $lineArr[0]));
+                $bugRankData[$lineArr[2]] = array($lineArr[1] , (int) $lineArr[0]);
                 /**e.g.  'NP_ALWAYS_NULL' => array('BugPattern' , '-1')*/
             }
         }
@@ -329,12 +379,47 @@ TEMPLATE;
         return $bugRankData;
     }
 
-    private function getBugPatternRank($bugPatternName, $bugCategoryName, $bugKind, array $bugRankData, OutputInterface $output)
+    private function loadPluginBugPatternData($url, OutputInterface $output)
+    {
+        $bugPatternData = array();
+        $content = $this->getFileByUrl($url, $output);
+
+        if(empty($content)){
+            throw new \RuntimeException('Cannot load Description data for Plugin Bug Pattern');
+        }
+
+        $doc = XmlUtils::safeParse($content);
+        foreach($doc->xpath('//BugPattern') as $bugPattern) {
+            $bugPatternName = (string) $bugPattern->attributes()->type;
+            $description = (string) $bugPattern->ShortDescription;
+            $longDescription = (string) $bugPattern->LongDescription;
+            $details = (string) $bugPattern->Details;
+
+            if (preg_match("/\{([^\}]+)\}/", $longDescription)){
+                $bugPatternData['SECURITY.'.$bugPatternName] = array(
+                    'description' => $description,
+                    'message' => $longDescription,
+                    'rank' => 5,
+                    'details' => $details
+                );
+            }else{
+                $bugPatternData['SECURITY.'.$bugPatternName] = array(
+                    'description' => $description,
+                    'rank' => 5,
+                    'details' => $details
+                );
+            }
+        }
+        return $bugPatternData;
+
+    }
+
+    private function getBugPatternRank($bugPatternName, $bugCategoryName, $bugKind, array $bugRankData)
     {
         $rank = 0;
-        foreach($bugRankData as $key => $array){
+        foreach($bugRankData as $key => $value){
             if($key === $bugPatternName || $key === $bugCategoryName || $key === $bugKind){
-                $rank += $array[1];
+                $rank += $value[1];
             }
         }
         /**Balance Value for Rank Caculation*/
@@ -362,7 +447,7 @@ TEMPLATE;
     {
         switch ($bugCategory) {
             case "CORRECTNESS":
-                return array('correctness' => 'Correctness');
+                return array('bug' => 'Bug');
             case "SECURITY":
                 return array('security' => 'Security');
             case "BAD_PRACTICE":
@@ -372,7 +457,7 @@ TEMPLATE;
             case "PERFORMANCE":
                 return array('performance' => 'Performance');
             case "MALICIOUS_CODE":
-                return array('security' => 'Security', 'malicious-code' => 'Malicious Code');
+                return array('security' => 'Security');
             case "MT_CORRECTNESS":
                 return array('multi-threading' => 'Multi Threading');
             case "I18N":
@@ -389,7 +474,6 @@ TEMPLATE;
             ->getOneOrNullResult();
 
         if ($label === null) {
-            $output->writeln("label not found, create a new one named", $labelName);
             $label = $this->createLabel($labelName, $slugName, $output);
         }
 
