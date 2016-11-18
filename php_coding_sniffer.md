@@ -1,3 +1,5 @@
+Add custom coding standard in configuration:
+
 ```yaml
 
   build:
